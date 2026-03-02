@@ -103,6 +103,171 @@ class CredentialManager: @unchecked Sendable {
     }
 }
 
+// MARK: - Usage Models
+
+struct UsageBucket: Codable {
+    let utilization: Double
+    let resetsAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case utilization
+        case resetsAt = "resets_at"
+    }
+}
+
+struct UsageResponse: Codable {
+    let fiveHour: UsageBucket?
+    let sevenDay: UsageBucket?
+
+    enum CodingKeys: String, CodingKey {
+        case fiveHour = "five_hour"
+        case sevenDay = "seven_day"
+    }
+}
+
+// MARK: - Token Refresh Response
+
+private struct TokenRefreshResponse: Codable {
+    let accessToken: String
+    let refreshToken: String
+    let expiresIn: Int
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case expiresIn = "expires_in"
+    }
+}
+
+// MARK: - API Client
+
+enum APIError: Error {
+    case noCredentials
+    case refreshFailed
+    case httpError(Int)
+    case decodingError(Error)
+    case networkError(Error)
+}
+
+class APIClient: @unchecked Sendable {
+    let credentialManager: CredentialManager
+    private var currentCredentials: OAuthCredentials?
+
+    init(credentialManager: CredentialManager) {
+        self.credentialManager = credentialManager
+    }
+
+    func fetchUsage(completion: @escaping @Sendable (Result<UsageResponse, Error>) -> Void) {
+        guard let creds = credentialManager.readCredentials() else {
+            completion(.failure(APIError.noCredentials))
+            return
+        }
+        currentCredentials = creds
+
+        if creds.isExpired {
+            refreshToken(creds.refreshToken) { [weak self] newToken in
+                guard let self, let newToken else {
+                    completion(.failure(APIError.refreshFailed))
+                    return
+                }
+                self.performUsageRequest(token: newToken, retryOnAuth: true, completion: completion)
+            }
+        } else {
+            performUsageRequest(token: creds.accessToken, retryOnAuth: true, completion: completion)
+        }
+    }
+
+    private func performUsageRequest(
+        token: String,
+        retryOnAuth: Bool,
+        completion: @escaping @Sendable (Result<UsageResponse, Error>) -> Void
+    ) {
+        let url = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if let error {
+                completion(.failure(APIError.networkError(error)))
+                return
+            }
+
+            let httpResponse = response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode ?? 0
+
+            // On 401/403, try refreshing once
+            if (statusCode == 401 || statusCode == 403) && retryOnAuth {
+                guard let self, let creds = self.currentCredentials else {
+                    completion(.failure(APIError.refreshFailed))
+                    return
+                }
+                self.refreshToken(creds.refreshToken) { [weak self] newToken in
+                    guard let self, let newToken else {
+                        completion(.failure(APIError.refreshFailed))
+                        return
+                    }
+                    self.performUsageRequest(token: newToken, retryOnAuth: false, completion: completion)
+                }
+                return
+            }
+
+            guard statusCode == 200, let data else {
+                completion(.failure(APIError.httpError(statusCode)))
+                return
+            }
+
+            do {
+                let usage = try JSONDecoder().decode(UsageResponse.self, from: data)
+                completion(.success(usage))
+            } catch {
+                completion(.failure(APIError.decodingError(error)))
+            }
+        }
+        task.resume()
+    }
+
+    private func refreshToken(_ token: String, completion: @escaping @Sendable (String?) -> Void) {
+        let url = URL(string: "https://platform.claude.com/v1/oauth/token")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: String] = [
+            "grant_type": "refresh_token",
+            "refresh_token": token,
+            "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers"
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let data, error == nil else {
+                completion(nil)
+                return
+            }
+
+            do {
+                let refreshResponse = try JSONDecoder().decode(TokenRefreshResponse.self, from: data)
+                let newExpiresAt = Int64(Date().timeIntervalSince1970 * 1000) + Int64(refreshResponse.expiresIn) * 1000
+                let newCreds = OAuthCredentials(
+                    accessToken: refreshResponse.accessToken,
+                    refreshToken: refreshResponse.refreshToken,
+                    expiresAt: newExpiresAt
+                )
+                self?.currentCredentials = newCreds
+                self?.credentialManager.persistCredentials(newCreds)
+                completion(refreshResponse.accessToken)
+            } catch {
+                print("[meter] Failed to decode refresh response: \(error)")
+                completion(nil)
+            }
+        }
+        task.resume()
+    }
+}
+
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -133,6 +298,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+
+        // Temporary test call for API client
+        let credManager = CredentialManager()
+        let apiClient = APIClient(credentialManager: credManager)
+        apiClient.fetchUsage { result in
+            switch result {
+            case .success(let usage):
+                print("[meter] Usage - 5h: \(usage.fiveHour?.utilization ?? -1)%, 7d: \(usage.sevenDay?.utilization ?? -1)%")
+            case .failure(let error):
+                print("[meter] Fetch error: \(error)")
+            }
+        }
     }
 }
 
