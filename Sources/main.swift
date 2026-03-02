@@ -1,5 +1,6 @@
 @preconcurrency import Cocoa
 import Security
+import os
 
 // MARK: - Credential Models
 
@@ -49,7 +50,7 @@ class CredentialManager: @unchecked Sendable {
                 expiresAt: file.claudeAiOauth.expiresAt
             )
         } catch {
-            print("[meter] Failed to decode credentials file: \(error)")
+            os_log(.error, "[meter] Failed to decode credentials file: %{public}@", error.localizedDescription)
             return nil
         }
     }
@@ -79,7 +80,7 @@ class CredentialManager: @unchecked Sendable {
                 expiresAt: file.claudeAiOauth.expiresAt
             )
         } catch {
-            print("[meter] Failed to decode Keychain credentials: \(error)")
+            os_log(.error, "[meter] Failed to decode Keychain credentials: %{public}@", error.localizedDescription)
             return nil
         }
     }
@@ -96,9 +97,12 @@ class CredentialManager: @unchecked Sendable {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .prettyPrinted
             let data = try encoder.encode(file)
-            try data.write(to: URL(fileURLWithPath: path))
+            let dirPath = (path as NSString).deletingLastPathComponent
+            try FileManager.default.createDirectory(atPath: dirPath, withIntermediateDirectories: true)
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
         } catch {
-            print("[meter] Failed to persist credentials: \(error)")
+            os_log(.error, "[meter] Failed to persist credentials: %{public}@", error.localizedDescription)
         }
     }
 }
@@ -150,8 +154,16 @@ enum APIError: Error {
 }
 
 class APIClient: @unchecked Sendable {
+    private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+    private static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+
     let credentialManager: CredentialManager
-    private var currentCredentials: OAuthCredentials?
+    private let lock = DispatchQueue(label: "com.claude.usage-meter.api-client")
+    private var _currentCredentials: OAuthCredentials?
+    private var currentCredentials: OAuthCredentials? {
+        get { lock.sync { _currentCredentials } }
+        set { lock.sync { _currentCredentials = newValue } }
+    }
 
     init(credentialManager: CredentialManager) {
         self.credentialManager = credentialManager
@@ -182,8 +194,7 @@ class APIClient: @unchecked Sendable {
         retryOnAuth: Bool,
         completion: @escaping @Sendable (Result<UsageResponse, Error>) -> Void
     ) {
-        let url = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: Self.usageURL)
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -230,8 +241,7 @@ class APIClient: @unchecked Sendable {
     }
 
     private func refreshToken(_ token: String, completion: @escaping @Sendable (String?) -> Void) {
-        let url = URL(string: "https://platform.claude.com/v1/oauth/token")!
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: Self.tokenURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -242,8 +252,17 @@ class APIClient: @unchecked Sendable {
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        let task = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let data, error == nil else {
+                os_log(.error, "[meter] Token refresh network error: %{public}@", error?.localizedDescription ?? "unknown")
+                completion(nil)
+                return
+            }
+
+            let httpResponse = response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode ?? 0
+            guard statusCode == 200 else {
+                os_log(.error, "[meter] Token refresh failed with status %d", statusCode)
                 completion(nil)
                 return
             }
@@ -260,7 +279,7 @@ class APIClient: @unchecked Sendable {
                 self?.credentialManager.persistCredentials(newCreds)
                 completion(refreshResponse.accessToken)
             } catch {
-                print("[meter] Failed to decode refresh response: \(error)")
+                os_log(.error, "[meter] Failed to decode refresh response: %{public}@", error.localizedDescription)
                 completion(nil)
             }
         }
@@ -280,7 +299,7 @@ func colorForPercent(_ pct: Double) -> NSColor {
     }
 }
 
-func drawMenuBarIcon(fiveHour: Double, sevenDay: Double) -> NSImage {
+func drawMenuBarIcon(fiveHour: Double, sevenDay: Double, error: Bool = false) -> NSImage {
     let image = NSImage(size: NSSize(width: 30, height: 22), flipped: false) { _ in
         let trackColor = NSColor(red: 0x3a / 255.0, green: 0x35 / 255.0, blue: 0x30 / 255.0, alpha: 1.0)
         let trackX: CGFloat = 3
@@ -310,6 +329,17 @@ func drawMenuBarIcon(fiveHour: Double, sevenDay: Double) -> NSImage {
             let bottomFill = NSBezierPath(roundedRect: NSRect(x: trackX, y: 5, width: bottomFillWidth, height: barHeight), xRadius: cornerRadius, yRadius: cornerRadius)
             colorForPercent(sevenDay).setFill()
             bottomFill.fill()
+        }
+
+        // Draw error indicator when there's no data and fetch failed
+        if error {
+            let errorFont = NSFont.boldSystemFont(ofSize: 11)
+            let errorAttrs: [NSAttributedString.Key: Any] = [
+                .font: errorFont,
+                .foregroundColor: NSColor(red: 231.0 / 255.0, green: 76.0 / 255.0, blue: 60.0 / 255.0, alpha: 1.0)
+            ]
+            let errorStr = NSAttributedString(string: "!", attributes: errorAttrs)
+            errorStr.draw(at: NSPoint(x: trackX + trackWidth - 3, y: 5))
         }
 
         return true
@@ -428,11 +458,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var apiClient: APIClient!
     var currentUsage: UsageResponse?
     private var pollingTimer: Timer?
+    private var retryTimer: Timer?
+    private var hasError: Bool = false
 
     private var fiveHourView: UsageMenuItemView!
     private var sevenDayView: UsageMenuItemView!
 
+    // I5: Cache claude path to avoid blocking main thread repeatedly
+    private var cachedClaudePath: String?
+    private var claudePathResolved = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // M4: Set activation policy programmatically
+        NSApp.setActivationPolicy(.accessory)
+
         apiClient = APIClient(credentialManager: credentialManager)
 
         statusItem = NSStatusBar.system.statusItem(withLength: 30)
@@ -473,9 +512,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         fetchUsage()
 
-        // Poll every 5 minutes
+        // M3: Poll every 5 minutes (Timer on main run loop already dispatches on main)
         pollingTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async {
+            MainActor.assumeIsolated {
                 self?.fetchUsage()
             }
         }
@@ -484,7 +523,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateIcon() {
         let fiveHour = currentUsage?.fiveHour?.utilization ?? 0
         let sevenDay = currentUsage?.sevenDay?.utilization ?? 0
-        let icon = drawMenuBarIcon(fiveHour: fiveHour, sevenDay: sevenDay)
+        let showError = hasError && currentUsage == nil
+        let icon = drawMenuBarIcon(fiveHour: fiveHour, sevenDay: sevenDay, error: showError)
         statusItem.button?.image = icon
     }
 
@@ -510,21 +550,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func fetchUsage() {
+        // Cancel any pending retry timer
+        retryTimer?.invalidate()
+        retryTimer = nil
+
         apiClient.fetchUsage { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
                 case .success(let usage):
+                    self.hasError = false
                     self.currentUsage = usage
                     self.updateIcon()
                     self.updateMenu()
-                    print("[meter] Usage - 5h: \(usage.fiveHour?.utilization ?? -1)%, 7d: \(usage.sevenDay?.utilization ?? -1)%")
+                    os_log(.info, "[meter] Usage - 5h: %.1f%%, 7d: %.1f%%", usage.fiveHour?.utilization ?? -1, usage.sevenDay?.utilization ?? -1)
                 case .failure(let error):
-                    print("[meter] Fetch error: \(error)")
+                    self.hasError = true
+                    os_log(.error, "[meter] Fetch error: %{public}@", String(describing: error))
                     // Keep last known data; only reset if we never had data
                     if self.currentUsage == nil {
                         self.updateIcon()
                         self.updateMenu()
+                    }
+                    // I4: Retry after 30 seconds when we have no data
+                    if self.currentUsage == nil {
+                        self.retryTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+                            MainActor.assumeIsolated {
+                                self?.fetchUsage()
+                            }
+                        }
                     }
                 }
             }
@@ -539,10 +593,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         loginAndFetch()
     }
 
+    // I5: Cache the claude path so `which` only runs once
     private func findClaudePath() -> String? {
+        if claudePathResolved { return cachedClaudePath }
+        claudePathResolved = true
+
         let knownPaths = ["/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
         for path in knownPaths {
             if FileManager.default.isExecutableFile(atPath: path) {
+                cachedClaudePath = path
                 return path
             }
         }
@@ -559,24 +618,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !result.isEmpty && FileManager.default.isExecutableFile(atPath: result) {
+                cachedClaudePath = result
                 return result
             }
         } catch {
-            print("[meter] Failed to run which: \(error)")
+            os_log(.error, "[meter] Failed to run which: %{public}@", error.localizedDescription)
         }
         return nil
     }
 
+    // C1: Escape AppleScript path to prevent command injection
     private func loginAndFetch() {
         guard let claudePath = findClaudePath() else {
-            print("[meter] Claude CLI not found")
+            os_log(.error, "[meter] Claude CLI not found")
             return
         }
-        let script = "tell application \"Terminal\" to do script \"\(claudePath) /login\""
+        let escaped = claudePath.replacingOccurrences(of: "\\", with: "\\\\")
+                                .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "tell application \"Terminal\" to do script \"\(escaped) /login\""
         var errorInfo: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
         if let errorInfo {
-            print("[meter] AppleScript error: \(errorInfo)")
+            os_log(.error, "[meter] AppleScript error: %{public}@", errorInfo.description)
         }
     }
 }

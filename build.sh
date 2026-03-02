@@ -5,7 +5,8 @@ swiftc Sources/main.swift \
   -o .build/ClaudeUsageMeter \
   -framework Cocoa \
   -framework Security \
-  -swift-version 6
+  -swift-version 6 \
+  -O
 echo "Built: .build/ClaudeUsageMeter"
 
 # Create .app bundle
