@@ -1,4 +1,107 @@
 @preconcurrency import Cocoa
+import Security
+
+// MARK: - Credential Models
+
+struct OAuthCredentials {
+    var accessToken: String
+    var refreshToken: String
+    var expiresAt: Int64  // milliseconds since epoch
+
+    var isExpired: Bool {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        return nowMs >= expiresAt
+    }
+}
+
+struct ClaudeAiOAuth: Codable {
+    let accessToken: String
+    let refreshToken: String
+    let expiresAt: Int64
+}
+
+struct CredentialFile: Codable {
+    let claudeAiOauth: ClaudeAiOAuth
+}
+
+// MARK: - Credential Manager
+
+class CredentialManager: @unchecked Sendable {
+    func readCredentials() -> OAuthCredentials? {
+        // Try file first, then Keychain
+        if let creds = readFromFile() {
+            return creds
+        }
+        return readFromKeychain()
+    }
+
+    private func readFromFile() -> OAuthCredentials? {
+        let path = NSString("~/.claude/.credentials.json").expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return nil
+        }
+        do {
+            let decoder = JSONDecoder()
+            let file = try decoder.decode(CredentialFile.self, from: data)
+            return OAuthCredentials(
+                accessToken: file.claudeAiOauth.accessToken,
+                refreshToken: file.claudeAiOauth.refreshToken,
+                expiresAt: file.claudeAiOauth.expiresAt
+            )
+        } catch {
+            print("[meter] Failed to decode credentials file: \(error)")
+            return nil
+        }
+    }
+
+    private func readFromKeychain() -> OAuthCredentials? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess, let data = result as? Data else {
+            return nil
+        }
+
+        // The Keychain stores a JSON string as the password data
+        do {
+            let decoder = JSONDecoder()
+            let file = try decoder.decode(CredentialFile.self, from: data)
+            return OAuthCredentials(
+                accessToken: file.claudeAiOauth.accessToken,
+                refreshToken: file.claudeAiOauth.refreshToken,
+                expiresAt: file.claudeAiOauth.expiresAt
+            )
+        } catch {
+            print("[meter] Failed to decode Keychain credentials: \(error)")
+            return nil
+        }
+    }
+
+    func persistCredentials(_ creds: OAuthCredentials) {
+        let path = NSString("~/.claude/.credentials.json").expandingTildeInPath
+        let oauthData = ClaudeAiOAuth(
+            accessToken: creds.accessToken,
+            refreshToken: creds.refreshToken,
+            expiresAt: creds.expiresAt
+        )
+        let file = CredentialFile(claudeAiOauth: oauthData)
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            let data = try encoder.encode(file)
+            try data.write(to: URL(fileURLWithPath: path))
+        } catch {
+            print("[meter] Failed to persist credentials: \(error)")
+        }
+    }
+}
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
