@@ -427,6 +427,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var credentialManager: CredentialManager = CredentialManager()
     var apiClient: APIClient!
     var currentUsage: UsageResponse?
+    private var pollingTimer: Timer?
 
     private var fiveHourView: UsageMenuItemView!
     private var sevenDayView: UsageMenuItemView!
@@ -471,6 +472,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
 
         fetchUsage()
+
+        // Poll every 5 minutes
+        pollingTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.fetchUsage()
+            }
+        }
     }
 
     func updateIcon() {
@@ -513,9 +521,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     print("[meter] Usage - 5h: \(usage.fiveHour?.utilization ?? -1)%, 7d: \(usage.sevenDay?.utilization ?? -1)%")
                 case .failure(let error):
                     print("[meter] Fetch error: \(error)")
-                    self.currentUsage = nil
-                    self.updateIcon()
-                    self.updateMenu()
+                    // Keep last known data; only reset if we never had data
+                    if self.currentUsage == nil {
+                        self.updateIcon()
+                        self.updateMenu()
+                    }
                 }
             }
         }
@@ -526,7 +536,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func loginClicked() {
-        print("[meter] Login placeholder")
+        loginAndFetch()
+    }
+
+    private func findClaudePath() -> String? {
+        let knownPaths = ["/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
+        for path in knownPaths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        // Fall back to `which claude`
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["claude"]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !result.isEmpty && FileManager.default.isExecutableFile(atPath: result) {
+                return result
+            }
+        } catch {
+            print("[meter] Failed to run which: \(error)")
+        }
+        return nil
+    }
+
+    private func loginAndFetch() {
+        guard let claudePath = findClaudePath() else {
+            print("[meter] Claude CLI not found")
+            return
+        }
+        let script = "tell application \"Terminal\" to do script \"\(claudePath) /login\""
+        var errorInfo: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
+        if let errorInfo {
+            print("[meter] AppleScript error: \(errorInfo)")
+        }
     }
 }
 
