@@ -318,12 +318,118 @@ func drawMenuBarIcon(fiveHour: Double, sevenDay: Double) -> NSImage {
     return image
 }
 
+// MARK: - Reset Time Formatting
+
+func formatResetTime(_ isoString: String) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    guard let resetDate = formatter.date(from: isoString) ?? {
+        // Try without fractional seconds as fallback
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        return f2.date(from: isoString)
+    }() else {
+        return ""
+    }
+
+    let now = Date()
+    let delta = resetDate.timeIntervalSince(now)
+    guard delta > 0 else { return "Resets soon" }
+
+    let totalMinutes = Int(delta) / 60
+    let days = totalMinutes / (60 * 24)
+    let hours = (totalMinutes % (60 * 24)) / 60
+    let minutes = totalMinutes % 60
+
+    if days > 0 {
+        return "Resets in \(days)d \(hours)h"
+    } else if hours > 0 {
+        return "Resets in \(hours)h \(minutes)m"
+    } else {
+        return "Resets in \(minutes)m"
+    }
+}
+
+// MARK: - Usage Menu Item View
+
+class UsageMenuItemView: NSView {
+    let title: String
+    var percentage: Double = 0
+    var resetTime: String = ""
+
+    init(title: String) {
+        self.title = title
+        super.init(frame: NSRect(x: 0, y: 0, width: 250, height: 52))
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bgColor = NSColor(red: 0x2a / 255.0, green: 0x25 / 255.0, blue: 0x20 / 255.0, alpha: 1.0)
+        bgColor.setFill()
+        dirtyRect.fill()
+
+        let padding: CGFloat = 12
+        let contentWidth = bounds.width - padding * 2
+
+        // Title (left) and percentage (right) - top row
+        let titleFont = NSFont.boldSystemFont(ofSize: 13)
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: titleFont,
+            .foregroundColor: NSColor.white
+        ]
+        let titleStr = NSAttributedString(string: title, attributes: titleAttrs)
+        titleStr.draw(at: NSPoint(x: padding, y: bounds.height - 18))
+
+        let pctStr = NSAttributedString(string: "\(Int(percentage))%", attributes: titleAttrs)
+        let pctSize = pctStr.size()
+        pctStr.draw(at: NSPoint(x: bounds.width - padding - pctSize.width, y: bounds.height - 18))
+
+        // Progress bar - middle row
+        let barY: CGFloat = bounds.height - 30
+        let barHeight: CGFloat = 6
+        let cornerRadius: CGFloat = 3
+
+        let trackColor = NSColor(red: 0x3a / 255.0, green: 0x35 / 255.0, blue: 0x30 / 255.0, alpha: 1.0)
+        let trackRect = NSRect(x: padding, y: barY, width: contentWidth, height: barHeight)
+        let trackPath = NSBezierPath(roundedRect: trackRect, xRadius: cornerRadius, yRadius: cornerRadius)
+        trackColor.setFill()
+        trackPath.fill()
+
+        let fillWidth = contentWidth * CGFloat(min(max(percentage, 0), 100) / 100.0)
+        if fillWidth > 0 {
+            let fillRect = NSRect(x: padding, y: barY, width: fillWidth, height: barHeight)
+            let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: cornerRadius, yRadius: cornerRadius)
+            colorForPercent(percentage).setFill()
+            fillPath.fill()
+        }
+
+        // Reset time text - bottom row
+        if !resetTime.isEmpty {
+            let resetFont = NSFont.systemFont(ofSize: 10)
+            let resetAttrs: [NSAttributedString.Key: Any] = [
+                .font: resetFont,
+                .foregroundColor: NSColor.gray
+            ]
+            let resetStr = NSAttributedString(string: resetTime, attributes: resetAttrs)
+            resetStr.draw(at: NSPoint(x: padding, y: 4))
+        }
+    }
+}
+
+// MARK: - App Delegate
+
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     var credentialManager: CredentialManager = CredentialManager()
     var apiClient: APIClient!
     var currentUsage: UsageResponse?
+
+    private var fiveHourView: UsageMenuItemView!
+    private var sevenDayView: UsageMenuItemView!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         apiClient = APIClient(credentialManager: credentialManager)
@@ -333,8 +439,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Show gray bars initially
         updateIcon()
 
+        // Build the menu
+        fiveHourView = UsageMenuItemView(title: "Session (5h)")
+        sevenDayView = UsageMenuItemView(title: "Weekly (7d)")
+
         let menu = NSMenu()
+        menu.appearance = NSAppearance(named: .darkAqua)
+
+        let fiveHourItem = NSMenuItem()
+        fiveHourItem.view = fiveHourView
+        menu.addItem(fiveHourItem)
+
+        let sevenDayItem = NSMenuItem()
+        sevenDayItem.view = sevenDayView
+        menu.addItem(sevenDayItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshClicked), keyEquivalent: "r")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
+
+        let loginItem = NSMenuItem(title: "Log in...", action: #selector(loginClicked), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(loginItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
         statusItem.menu = menu
 
         fetchUsage()
@@ -347,6 +480,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = icon
     }
 
+    func updateMenu() {
+        let fiveHourPct = currentUsage?.fiveHour?.utilization ?? 0
+        let sevenDayPct = currentUsage?.sevenDay?.utilization ?? 0
+
+        fiveHourView.percentage = fiveHourPct
+        if let resetAt = currentUsage?.fiveHour?.resetsAt {
+            fiveHourView.resetTime = formatResetTime(resetAt)
+        } else {
+            fiveHourView.resetTime = ""
+        }
+        fiveHourView.needsDisplay = true
+
+        sevenDayView.percentage = sevenDayPct
+        if let resetAt = currentUsage?.sevenDay?.resetsAt {
+            sevenDayView.resetTime = formatResetTime(resetAt)
+        } else {
+            sevenDayView.resetTime = ""
+        }
+        sevenDayView.needsDisplay = true
+    }
+
     func fetchUsage() {
         apiClient.fetchUsage { [weak self] result in
             DispatchQueue.main.async {
@@ -355,14 +509,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 case .success(let usage):
                     self.currentUsage = usage
                     self.updateIcon()
+                    self.updateMenu()
                     print("[meter] Usage - 5h: \(usage.fiveHour?.utilization ?? -1)%, 7d: \(usage.sevenDay?.utilization ?? -1)%")
                 case .failure(let error):
                     print("[meter] Fetch error: \(error)")
                     self.currentUsage = nil
                     self.updateIcon()
+                    self.updateMenu()
                 }
             }
         }
+    }
+
+    @objc func refreshClicked() {
+        fetchUsage()
+    }
+
+    @objc func loginClicked() {
+        print("[meter] Login placeholder")
     }
 }
 
