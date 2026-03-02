@@ -268,46 +268,99 @@ class APIClient: @unchecked Sendable {
     }
 }
 
+// MARK: - Icon Rendering
+
+func colorForPercent(_ pct: Double) -> NSColor {
+    if pct <= 50 {
+        return NSColor(red: 217.0 / 255.0, green: 119.0 / 255.0, blue: 60.0 / 255.0, alpha: 1.0)
+    } else if pct <= 80 {
+        return NSColor(red: 232.0 / 255.0, green: 168.0 / 255.0, blue: 56.0 / 255.0, alpha: 1.0)
+    } else {
+        return NSColor(red: 231.0 / 255.0, green: 76.0 / 255.0, blue: 60.0 / 255.0, alpha: 1.0)
+    }
+}
+
+func drawMenuBarIcon(fiveHour: Double, sevenDay: Double) -> NSImage {
+    let image = NSImage(size: NSSize(width: 30, height: 22), flipped: false) { _ in
+        let trackColor = NSColor(red: 0x3a / 255.0, green: 0x35 / 255.0, blue: 0x30 / 255.0, alpha: 1.0)
+        let trackX: CGFloat = 3
+        let trackWidth: CGFloat = 24
+        let barHeight: CGFloat = 4
+        let cornerRadius: CGFloat = 2
+
+        // Top bar (5h usage) at y=13
+        let topTrack = NSBezierPath(roundedRect: NSRect(x: trackX, y: 13, width: trackWidth, height: barHeight), xRadius: cornerRadius, yRadius: cornerRadius)
+        trackColor.setFill()
+        topTrack.fill()
+
+        let topFillWidth = trackWidth * CGFloat(min(max(fiveHour, 0), 100) / 100.0)
+        if topFillWidth > 0 {
+            let topFill = NSBezierPath(roundedRect: NSRect(x: trackX, y: 13, width: topFillWidth, height: barHeight), xRadius: cornerRadius, yRadius: cornerRadius)
+            colorForPercent(fiveHour).setFill()
+            topFill.fill()
+        }
+
+        // Bottom bar (7d usage) at y=5
+        let bottomTrack = NSBezierPath(roundedRect: NSRect(x: trackX, y: 5, width: trackWidth, height: barHeight), xRadius: cornerRadius, yRadius: cornerRadius)
+        trackColor.setFill()
+        bottomTrack.fill()
+
+        let bottomFillWidth = trackWidth * CGFloat(min(max(sevenDay, 0), 100) / 100.0)
+        if bottomFillWidth > 0 {
+            let bottomFill = NSBezierPath(roundedRect: NSRect(x: trackX, y: 5, width: bottomFillWidth, height: barHeight), xRadius: cornerRadius, yRadius: cornerRadius)
+            colorForPercent(sevenDay).setFill()
+            bottomFill.fill()
+        }
+
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    var credentialManager: CredentialManager = CredentialManager()
+    var apiClient: APIClient!
+    var currentUsage: UsageResponse?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        apiClient = APIClient(credentialManager: credentialManager)
+
         statusItem = NSStatusBar.system.statusItem(withLength: 30)
 
-        let icon = NSImage(size: NSSize(width: 30, height: 22), flipped: false) { rect in
-            let trackColor = NSColor(red: 0x3a / 255.0, green: 0x35 / 255.0, blue: 0x30 / 255.0, alpha: 1.0)
-            trackColor.setFill()
-
-            // Top bar: y=4, height=4, full width
-            let topBar = NSRect(x: 0, y: 4, width: rect.width, height: 4)
-            topBar.fill()
-
-            // Bottom bar: y=13, height=4, full width
-            let bottomBar = NSRect(x: 0, y: 13, width: rect.width, height: 4)
-            bottomBar.fill()
-
-            return true
-        }
-        icon.isTemplate = false
-
-        if let button = statusItem.button {
-            button.image = icon
-        }
+        // Show gray bars initially
+        updateIcon()
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
 
-        // Temporary test call for API client
-        let credManager = CredentialManager()
-        let apiClient = APIClient(credentialManager: credManager)
-        apiClient.fetchUsage { result in
-            switch result {
-            case .success(let usage):
-                print("[meter] Usage - 5h: \(usage.fiveHour?.utilization ?? -1)%, 7d: \(usage.sevenDay?.utilization ?? -1)%")
-            case .failure(let error):
-                print("[meter] Fetch error: \(error)")
+        fetchUsage()
+    }
+
+    func updateIcon() {
+        let fiveHour = currentUsage?.fiveHour?.utilization ?? 0
+        let sevenDay = currentUsage?.sevenDay?.utilization ?? 0
+        let icon = drawMenuBarIcon(fiveHour: fiveHour, sevenDay: sevenDay)
+        statusItem.button?.image = icon
+    }
+
+    func fetchUsage() {
+        apiClient.fetchUsage { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let usage):
+                    self.currentUsage = usage
+                    self.updateIcon()
+                    print("[meter] Usage - 5h: \(usage.fiveHour?.utilization ?? -1)%, 7d: \(usage.sevenDay?.utilization ?? -1)%")
+                case .failure(let error):
+                    print("[meter] Fetch error: \(error)")
+                    self.currentUsage = nil
+                    self.updateIcon()
+                }
             }
         }
     }
